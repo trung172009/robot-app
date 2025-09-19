@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Robot Bón Phân — App</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  :root { --pad:12px }
+  body { font-family: system-ui, Arial; background:#fff; color:#000; margin:0; padding:var(--pad); -webkit-tap-highlight-color: transparent }
+  header{display:flex;justify-content:space-between;align-items:center}
+  h1{font-size:18px;margin:8px 0}
+  .btn{display:block;width:100%;padding:14px;border-radius:12px;border:2px solid #000;background:#fff;font-size:16px;margin:10px 0;text-align:center}
+  .controls{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin:8px 0}
+  .ctrl{width:100px;height:64px;border-radius:10px;border:1px solid #000;display:flex;align-items:center;justify-content:center;font-size:18px;user-select:none}
+  .small{font-size:13px;color:#333}
+  .hidden{display:none}
+  #log{max-height:220px;overflow:auto;border:1px dashed #ccc;padding:8px;border-radius:8px;margin-top:8px}
+  input[type="number"]{width:64px;padding:6px;border-radius:8px;border:1px solid #999}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .route-item{display:flex;justify-content:space-between;padding:6px 8px;border-bottom:1px solid #eee}
+</style>
+</head>
+<body>
+<header>
+  <h1>🚜 Robot Bón Phân</h1>
+  <div class="small" id="status">Chưa kết nối</div>
+</header>
+
+<button id="btnConnect" class="btn">🔌 Kết nối ESP32 (BLE)</button>
+
+<div id="mainMenu">
+  <button class="btn" onclick="show('control')">1️⃣ Điều khiển</button>
+  <button class="btn" onclick="show('schedule')">2️⃣ Hẹn giờ</button>
+  <button class="btn" onclick="show('history')">3️⃣ Lịch sử</button>
+</div>
+
+<section id="control" class="hidden">
+  <h2>Điều khiển trực tiếp</h2>
+  <div class="controls">
+    <div class="ctrl" onclick="sendCmd('FORWARD')">⬆️ Tiến</div>
+    <div class="ctrl" onclick="sendCmd('LEFT')">⬅️ Trái</div>
+    <div class="ctrl" onclick="sendCmd('STOP')">⏹ Dừng</div>
+    <div class="ctrl" onclick="sendCmd('RIGHT')">➡️ Phải</div>
+    <div class="ctrl" onclick="sendCmd('BACK')">⬇️ Lùi</div>
+  </div>
+
+  <div class="row">
+    <button class="btn" onclick="startRecording()">🔴 Bắt đầu ghi lộ trình</button>
+    <button class="btn" onclick="stopRecording()">⏺️ Dừng ghi</button>
+  </div>
+
+  <div class="row">
+    <input id="routeName" placeholder="Tên lộ trình (ví dụ: ruong_1)" style="flex:1;padding:10px;border-radius:8px;border:1px solid #999">
+    <button class="btn" style="width:auto;padding:10px" onclick="saveRoute()">💾 Lưu lộ trình</button>
+  </div>
+
+  <h3>Lộ trình đã lưu</h3>
+  <div id="routeList"></div>
+
+  <div style="margin-top:10px">
+    <button class="btn" onclick="backToMenu()">🔙 Về menu</button>
+  </div>
+</section>
+
+<section id="schedule" class="hidden">
+  <h2>Hẹn giờ chạy lộ trình</h2>
+  <div class="row">
+    <select id="selectRoute" style="flex:1;padding:10px;border-radius:8px;border:1px solid #999"></select>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>Giờ:
+      <input id="schHour" type="number" min="0" max="23" value="12"></label>
+    <label>Phút:
+      <input id="schMin" type="number" min="0" max="59" value="0"></label>
+    <button class="btn" style="width:auto" onclick="addSchedule()">➕ Thêm lịch</button>
+  </div>
+
+  <h3>Lịch đã set</h3>
+  <div id="scheduleList"></div>
+  <div style="margin-top:10px">
+    <button class="btn" onclick="backToMenu()">🔙 Về menu</button>
+  </div>
+</section>
+
+<section id="history" class="hidden">
+  <h2>Lịch sử hoạt động</h2>
+  <div id="historyList"></div>
+  <div style="margin-top:10px">
+    <button class="btn" onclick="syncHistory()">🔄 Đồng bộ từ robot</button>
+    <button class="btn" onclick="backToMenu()">🔙 Về menu</button>
+  </div>
+</section>
+
+<h3>Log</h3>
+<div id="log"></div>
+
+<script>
+/* BLE NUS UUIDs */
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // write
+const NUS_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // notify
+
+let device, server, txChar, rxChar;
+let isRecording = false;
+let currentRecord = []; // list of {cmd, t}
+let recordStart = 0;
+let schedules = JSON.parse(localStorage.getItem('robot_schedules_v1')||'[]');
+let historyList = JSON.parse(localStorage.getItem('robot_history_v1')||'[]');
+
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+
+function log(msg){
+  const p = document.createElement('div'); p.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`; logEl.prepend(p);
+}
+
+/* BLE connect */
+document.getElementById('btnConnect').addEventListener('click', async ()=>{
+  try{
+    log('Yêu cầu chọn thiết bị BLE...');
+    const opts = { filters: [{ services: [NUS_SERVICE] }] };
+    device = await navigator.bluetooth.requestDevice(opts);
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(NUS_SERVICE);
+    txChar = await svc.getCharacteristic(NUS_TX);
+    rxChar = await svc.getCharacteristic(NUS_RX);
+    await rxChar.startNotifications();
+    rxChar.addEventListener('characteristicvaluechanged', handleNotify);
+    setStatus('Đã kết nối: ' + (device.name||device.id));
+    log('Connected to ' + (device.name||device.id));
+    refreshRoutesUI();
+    refreshSchedulesUI();
+    refreshHistoryUI();
+  }catch(e){
+    console.error(e);
+    setStatus('Kết nối lỗi');
+    log('Kết nối lỗi: ' + e);
+  }
+});
+
+function onDisconnected(){
+  setStatus('Đã ngắt kết nối');
+  log('Device disconnected');
+}
+
+function setStatus(s){ statusEl.innerText = s; }
+
+/* send command */
+async function sendCmd(cmd){
+  setStatus('Gửi: '+cmd);
+  log('Gửi: '+cmd);
+  if(!txChar){ setStatus('Chưa kết nối'); log('Chưa có txChar'); return; }
+  // ensure newline terminated
+  const data = new TextEncoder().encode(cmd + '\n');
+  await txChar.writeValue(data);
+  if(isRecording){
+    const t = Date.now() - recordStart;
+    currentRecord.push({ cmd, t });
+    log('Ghi lệnh: '+cmd+' @'+t+'ms');
+  }
+}
+
+/* notifications from ESP32 */
+function handleNotify(e){
+  const value = new TextDecoder().decode(e.target.value);
+  log('RX: ' + value.trim());
+  // example: if device sends "RUN_DONE|12345" we can store history
+  if(value.startsWith('RUN_DONE|')){
+    // parse runtime ms
+    const parts = value.split('|');
+    const runMs = parseInt(parts[1]||0);
+    const entry = { date: new Date().toISOString(), durationMs: runMs };
+    historyList.unshift(entry);
+    localStorage.setItem('robot_history_v1', JSON.stringify(historyList));
+    refreshHistoryUI();
+  }
+}
+
+/* Recording */
+function startRecording(){
+  isRecording = true;
+  currentRecord = [];
+  recordStart = Date.now();
+  log('Bắt đầu ghi lộ trình');
+  setStatus('Đang ghi lộ trình');
+}
+function stopRecording(){
+  isRecording = false;
+  log('Dừng ghi lộ trình — tổng lệnh: '+ currentRecord.length);
+  setStatus('Đã dừng ghi');
+}
+
+function saveRoute(){
+  const name = document.getElementById('routeName').value.trim();
+  if(!name){ alert('Nhập tên lộ trình'); return; }
+  const saved = JSON.parse(localStorage.getItem('robot_routes_v1')||'{}');
+  saved[name] = currentRecord;
+  localStorage.setItem('robot_routes_v1', JSON.stringify(saved));
+  log('Lưu lộ trình: '+name+' len='+currentRecord.length);
+  refreshRoutesUI();
+  document.getElementById('routeName').value = '';
+}
+
+/* Routes UI */
+function refreshRoutesUI(){
+  const div = document.getElementById('routeList');
+  const sel = document.getElementById('selectRoute');
+  div.innerHTML = '';
+  sel.innerHTML = '';
+  const saved = JSON.parse(localStorage.getItem('robot_routes_v1')||'{}');
+  const keys = Object.keys(saved);
+  if(keys.length===0){
+    div.innerHTML = '<div class="small">Chưa có lộ trình nào</div>';
+    sel.innerHTML = '<option value="">-- Chọn lộ trình --</option>';
+    return;
+  }
+  sel.innerHTML = '<option value="">-- Chọn lộ trình --</option>';
+  keys.forEach(k=>{
+    const r = saved[k];
+    // list item
+    const el = document.createElement('div'); el.className='route-item';
+    el.innerHTML = `<div>${k} (${r.length} lệnh)</div><div>
+      <button onclick="playRouteName('${escape(k)}')" style="margin-right:6px">▶️</button>
+      <button onclick="downloadRoute('${escape(k)}')">⬇️</button>
+      <button onclick="deleteRoute('${escape(k)}')">🗑️</button>
+    </div>`;
+    div.appendChild(el);
+    const opt = document.createElement('option'); opt.value=k; opt.innerText=k; sel.appendChild(opt);
+  });
+}
+
+/* play route by name (app will send commands at same intervals) */
+async function playRouteName(nameEsc){
+  const name = unescape(nameEsc);
+  const saved = JSON.parse(localStorage.getItem('robot_routes_v1')||'{}');
+  const route = saved[name];
+  if(!route) { alert('Không tìm lộ trình'); return; }
+  log('Bắt đầu chạy lộ trình: '+name);
+  setStatus('Đang chạy: '+name);
+  // send commands with delays
+  for(let i=0;i<route.length;i++){
+    const item = route[i];
+    // if first command, wait item.t
+    const delay = (i===0)? item.t : (item.t - route[i-1].t);
+    await sleep(delay);
+    await sendCmd(item.cmd);
+  }
+  setStatus('Hoàn thành lộ trình');
+  log('Hoàn thành lộ trình: '+name);
+}
+
+/* helper sleep */
+function sleep(ms){ return new Promise(res=>setTimeout(res, ms)); }
+
+function downloadRoute(nameEsc){
+  const name = unescape(nameEsc);
+  const saved = JSON.parse(localStorage.getItem('robot_routes_v1')||'{}');
+  const data = saved[name];
+  const blob = new Blob([JSON.stringify(data)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download = name + '.json'; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function deleteRoute(nameEsc){
+  const name = unescape(nameEsc);
+  if(!confirm('Xóa lộ trình '+name+'?')) return;
+  const saved = JSON.parse(localStorage.getItem('robot_routes_v1')||'{}');
+  delete saved[name];
+  localStorage.setItem('robot_routes_v1', JSON.stringify(saved));
+  refreshRoutesUI();
+}
+
+/* Scheduling */
+function addSchedule(){
+  const route = document.getElementById('selectRoute').value;
+  const h = document.getElementById('schHour').value.padStart(2,'0');
+  const m = document.getElementById('schMin').value.padStart(2,'0');
+  if(!route){ alert('Chọn lộ trình'); return; }
+  const sched = { route, hour: parseInt(h), minute: parseInt(m) };
+  schedules.push(sched);
+  localStorage.setItem('robot_schedules_v1', JSON.stringify(schedules));
+  refreshSchedulesUI();
+  log('Đã thêm lịch: '+route+' @'+h+':'+m);
+}
+
+function refreshSchedulesUI(){
+  const div = document.getElementById('scheduleList');
+  div.innerHTML = '';
+  if(schedules.length===0) { div.innerHTML = '<div class="small">Chưa có lịch</div>'; return; }
+  schedules.forEach((s, idx)=>{
+    const el = document.createElement('div'); el.className='route-item';
+    el.innerHTML = `<div>${s.route} — ${String(s.hour).padStart(2,'0')}:${String(s.minute).padStart(2,'0')}</div>
+      <div><button onclick="runSchedule(${idx})">▶️</button> <button onclick="deleteSchedule(${idx})">🗑️</button></div>`;
+    div.appendChild(el);
+  });
+}
+function deleteSchedule(idx){ schedules.splice(idx,1); localStorage.setItem('robot_schedules_v1', JSON.stringify(schedules)); refreshSchedulesUI(); }
+function runSchedule(idx){ const s = schedules[idx]; playRouteName(escape(s.route)); }
+
+/* check schedules every minute */
+setInterval(()=>{
+  const now = new Date();
+  const hh = now.getHours(), mm = now.getMinutes();
+  schedules.forEach(s=>{
+    if(s.hour===hh && s.minute===mm){
+      log('Trigger schedule: '+s.route+' @'+hh+':'+mm);
+      playRouteName(escape(s.route));
+    }
+  });
+}, 60*1000);
+
+/* History UI */
+function refreshHistoryUI(){
+  const div = document.getElementById('historyList');
+  div.innerHTML = '';
+  if(historyList.length===0){ div.innerHTML = '<div class="small">Chưa có lịch sử</div>'; return; }
+  historyList.forEach(h=>{
+    const d = new Date(h.date);
+    const mins = Math.round((h.durationMs||0)/60000);
+    const el = document.createElement('div'); el.className='route-item';
+    el.innerHTML = `<div>${d.toLocaleDateString()} ${d.toLocaleTimeString()}</div><div>${mins} phút</div>`;
+    div.appendChild(el);
+  });
+}
+
+/* manual sync request to robot (device should support a notify message HISTORY|...) */
+async function syncHistory(){
+  await sendCmd('REQ_HISTORY');
+  log('Đã yêu cầu robot gửi lịch sử');
+}
+
+/* utility: go back */
+function backToMenu(){ ['control','schedule','history'].forEach(x=>document.getElementById(x).classList.add('hidden')); document.getElementById('mainMenu').style.display='block'; }
+function show(id){ document.getElementById('mainMenu').style.display='none'; ['control','schedule','history'].forEach(x=>document.getElementById(x).classList.add('hidden')); document.getElementById(id).classList.remove('hidden'); }
+
+/* helper for padStart on numeric value inputs (ensure string function exists) */
+if(!String.prototype.padStart){
+  String.prototype.padStart = function(len, ch = ' '){ let s = String(this); while(s.length < len) s = ch + s; return s; };
+}
+
+/* load UI from storage */
+refreshRoutesUI(); refreshSchedulesUI(); refreshHistoryUI();
+</script>
+</body>
+</html>
